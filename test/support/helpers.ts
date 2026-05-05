@@ -166,7 +166,12 @@ export const events = {
 	},
 
 	streamedAssistantMessage(text: string, model = "mock/test-model", responseId = "resp-mock"): object[] {
+		return events.streamedAssistantMessageDeltas([text], text, model, responseId);
+	},
+
+	streamedAssistantMessageDeltas(deltas: string[], finalText?: string, model = "mock/test-model", responseId = "resp-mock"): object[] {
 		const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } };
+		const fullText = finalText ?? deltas.join("");
 		return [
 			{
 				type: "message_start",
@@ -179,12 +184,24 @@ export const events = {
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
 				},
 			},
-			{
+			...deltas.map((delta) => ({
 				type: "message_update",
-				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: text },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
 				message: {
 					role: "assistant",
-					content: [{ type: "text", text }],
+					content: [{ type: "text", text: "" }],
+					model,
+					responseId,
+					stopReason: "stop",
+					usage,
+				},
+			})),
+			{
+				type: "message_update",
+				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "" },
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: fullText }],
 					model,
 					responseId,
 					stopReason: "stop",

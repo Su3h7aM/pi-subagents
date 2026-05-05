@@ -401,9 +401,11 @@ async function runSingleAttempt(
 			emitUpdateSnapshot(getFinalOutput(result.messages) || "(running...)");
 		};
 
+		type AssistantMessageEvent = { type?: string; delta?: string; content?: string };
 		let activeAssistantIndex: number | undefined;
 		let activeAssistantResponseId: string | undefined;
 		let activeAssistantUsage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } | undefined;
+		let activeAssistantStreamHasOutput = false;
 		const getAssistantResponseId = (message: Message): string | undefined => {
 			const responseId = (message as { responseId?: unknown }).responseId;
 			return typeof responseId === "string" && responseId.trim() ? responseId : undefined;
@@ -417,7 +419,26 @@ async function runSingleAttempt(
 		});
 		const isAssistantLifecycleEvent = (type: string): boolean => type === "message_start" || type === "message_update" || type === "message_end";
 		const isTerminalAssistantEvent = (rawType: string, assistantEventType?: string): boolean => rawType === "message_end"
-			|| (rawType === "message_update" && assistantEventType === "text_end");
+			|| (rawType === "message_update" && (assistantEventType === "text_end" || assistantEventType === "done"));
+		const getAssistantOutputText = (
+			message: Message,
+			rawType: string,
+			assistantEvent?: AssistantMessageEvent,
+		): string => {
+			if (rawType === "message_update") {
+				if (assistantEvent?.type === "text_delta") return assistantEvent.delta ?? "";
+				if (assistantEvent?.type === "text_end") return assistantEvent.content ?? "";
+				return "";
+			}
+			if (rawType === "message_end" && !activeAssistantStreamHasOutput) return extractTextFromContent(message.content);
+			return "";
+		};
+		const resetActiveAssistantState = () => {
+			activeAssistantIndex = undefined;
+			activeAssistantResponseId = undefined;
+			activeAssistantUsage = undefined;
+			activeAssistantStreamHasOutput = false;
+		};
 		const applyAssistantUsage = (usage: { input?: number; inputTokens?: number; output?: number; outputTokens?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } | undefined) => {
 			const next = toUsageSnapshot(usage);
 			const prev = activeAssistantUsage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
@@ -429,7 +450,7 @@ async function runSingleAttempt(
 			progress.tokens = result.usage.input + result.usage.output;
 			activeAssistantUsage = next;
 		};
-		const recordAssistantMessage = (message: Message, rawType: string, assistantEventType?: string) => {
+		const recordAssistantMessage = (message: Message, rawType: string, assistantEvent?: AssistantMessageEvent) => {
 			const responseId = getAssistantResponseId(message);
 			const isSameActiveStream = activeAssistantIndex !== undefined
 				&& (!responseId || !activeAssistantResponseId || responseId === activeAssistantResponseId);
@@ -441,6 +462,7 @@ async function runSingleAttempt(
 				activeAssistantIndex = result.messages.length - 1;
 				activeAssistantResponseId = responseId;
 				activeAssistantUsage = undefined;
+				activeAssistantStreamHasOutput = false;
 				result.usage.turns++;
 				progress.turnCount = result.usage.turns;
 			}
@@ -448,26 +470,26 @@ async function runSingleAttempt(
 			applyAssistantUsage(usage);
 			if (!result.model && (message as Message & { model?: string }).model) result.model = (message as Message & { model?: string }).model;
 			if ((message as Message & { errorMessage?: string }).errorMessage) result.error = (message as Message & { errorMessage?: string }).errorMessage;
-			appendRecentOutput(progress, extractTextFromContent(message.content).split("\n").slice(-10));
+			const outputText = getAssistantOutputText(message, rawType, assistantEvent);
+			if (outputText) {
+				activeAssistantStreamHasOutput = true;
+				appendRecentOutput(progress, outputText.split("\n").slice(-10));
+			}
 			const stopReason = (message as { stopReason?: string }).stopReason;
 			const hasToolCall = Array.isArray(message.content)
 				&& message.content.some((part) => (part as { type?: string }).type === "toolCall");
-			if (isTerminalAssistantEvent(rawType, assistantEventType) && stopReason === "stop" && !hasToolCall) {
+			if (isTerminalAssistantEvent(rawType, assistantEvent?.type) && stopReason === "stop" && !hasToolCall) {
 				cleanTerminalAssistantStopReceived ||= !(message as Message & { errorMessage?: string }).errorMessage;
 				startFinalDrain();
 			}
-			if (rawType === "message_end") {
-				activeAssistantIndex = undefined;
-				activeAssistantResponseId = undefined;
-				activeAssistantUsage = undefined;
-			}
+			if (rawType === "message_end") resetActiveAssistantState();
 		};
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
 			jsonlWriter.writeLine(line);
-			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown; assistantMessageEvent?: { type?: string } };
+			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown; assistantMessageEvent?: AssistantMessageEvent };
 			try {
-				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown; assistantMessageEvent?: { type?: string } };
+				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown; assistantMessageEvent?: AssistantMessageEvent };
 			} catch {
 				// Non-JSON stdout lines are expected; only structured events are parsed.
 				return;
@@ -513,7 +535,7 @@ async function runSingleAttempt(
 
 			if (isAssistantLifecycleEvent(evt.type) && evt.message) {
 				if (evt.message.role === "assistant") {
-					recordAssistantMessage(evt.message, evt.type, evt.assistantMessageEvent?.type);
+					recordAssistantMessage(evt.message, evt.type, evt.assistantMessageEvent);
 				} else if (evt.type === "message_end") {
 					result.messages.push(evt.message);
 				}

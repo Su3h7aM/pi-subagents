@@ -173,6 +173,19 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.usage.turns, 1);
 		assert.equal(result.usage.input, 100);
 		assert.equal(result.usage.output, 50);
+		assert.deepEqual(result.progress.recentOutput, ["Hello from streamed mock agent"]);
+	});
+
+	it("captures multiple text_delta chunks without duplicating the final text", async () => {
+		mockPi.onCall({ jsonl: events.streamedAssistantMessageDeltas(["Hello ", "from streamed ", "chunks"], "Hello from streamed chunks") });
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Say hello", {});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(getFinalOutput(result.messages), "Hello from streamed chunks");
+		assert.deepEqual(result.progress.recentOutput, ["Hello ", "from streamed ", "chunks"]);
+		assert.equal(result.progress.recentOutput.join(""), "Hello from streamed chunks");
+		assert.equal(result.usage.turns, 1);
 	});
 
 	it("does not force-drain after a non-terminal assistant message_start before later updates arrive", async () => {

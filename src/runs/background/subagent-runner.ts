@@ -262,9 +262,11 @@ function runPiStreaming(
 			appendChildEvent({ type, line });
 		};
 
+		type AssistantMessageEvent = { type?: string; delta?: string; content?: string };
 		let activeAssistantIndex: number | undefined;
 		let activeAssistantResponseId: string | undefined;
 		let activeAssistantUsage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } | undefined;
+		let activeAssistantStreamHasOutput = false;
 		const getAssistantResponseId = (message: ChildMessage): string | undefined => {
 			const responseId = (message as ChildMessage & { responseId?: unknown }).responseId;
 			return typeof responseId === "string" && responseId.trim() ? responseId : undefined;
@@ -278,7 +280,26 @@ function runPiStreaming(
 		});
 		const isAssistantLifecycleEvent = (type: string): boolean => type === "message_start" || type === "message_update" || type === "message_end";
 		const isTerminalAssistantEvent = (rawType: string, assistantEventType?: string): boolean => rawType === "message_end"
-			|| (rawType === "message_update" && assistantEventType === "text_end");
+			|| (rawType === "message_update" && (assistantEventType === "text_end" || assistantEventType === "done"));
+		const getAssistantOutputText = (
+			message: ChildMessage,
+			rawType: string,
+			assistantEvent?: AssistantMessageEvent,
+		): string => {
+			if (rawType === "message_update") {
+				if (assistantEvent?.type === "text_delta") return assistantEvent.delta ?? "";
+				if (assistantEvent?.type === "text_end") return assistantEvent.content ?? "";
+				return "";
+			}
+			if (rawType === "message_end" && !activeAssistantStreamHasOutput) return extractTextFromContent(message.content);
+			return "";
+		};
+		const resetActiveAssistantState = () => {
+			activeAssistantIndex = undefined;
+			activeAssistantResponseId = undefined;
+			activeAssistantUsage = undefined;
+			activeAssistantStreamHasOutput = false;
+		};
 		const applyAssistantUsage = (messageUsage: ChildUsage | undefined) => {
 			const next = toUsageSnapshot(messageUsage);
 			const prev = activeAssistantUsage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
@@ -290,7 +311,7 @@ function runPiStreaming(
 			usage.cost += next.cost - prev.cost;
 			activeAssistantUsage = next;
 		};
-		const recordAssistantMessage = (message: ChildMessage, rawType: string, assistantEventType?: string) => {
+		const recordAssistantMessage = (message: ChildMessage, rawType: string, assistantEvent?: AssistantMessageEvent) => {
 			const responseId = getAssistantResponseId(message);
 			const isSameActiveStream = activeAssistantIndex !== undefined
 				&& (!responseId || !activeAssistantResponseId || responseId === activeAssistantResponseId);
@@ -302,30 +323,30 @@ function runPiStreaming(
 				activeAssistantIndex = messages.length - 1;
 				activeAssistantResponseId = responseId;
 				activeAssistantUsage = undefined;
+				activeAssistantStreamHasOutput = false;
 			}
-			const text = extractTextFromContent(message.content);
-			if (text) writeOutputText(text);
+			const outputText = getAssistantOutputText(message, rawType, assistantEvent);
+			if (outputText) {
+				activeAssistantStreamHasOutput = true;
+				writeOutputText(outputText);
+			}
 			if (message.model) model = message.model;
 			if (message.errorMessage) error = message.errorMessage;
 			applyAssistantUsage(message.usage);
 			const stopReason = (message as { stopReason?: string }).stopReason;
 			const hasToolCall = Array.isArray(message.content)
 				&& message.content.some((part) => (part as { type?: string }).type === "toolCall");
-			if (isTerminalAssistantEvent(rawType, assistantEventType) && stopReason === "stop" && !hasToolCall) {
+			if (isTerminalAssistantEvent(rawType, assistantEvent?.type) && stopReason === "stop" && !hasToolCall) {
 				cleanTerminalAssistantStopReceived ||= !message.errorMessage;
 				startFinalDrain();
 			}
-			if (rawType === "message_end") {
-				activeAssistantIndex = undefined;
-				activeAssistantResponseId = undefined;
-				activeAssistantUsage = undefined;
-			}
+			if (rawType === "message_end") resetActiveAssistantState();
 		};
 		const processStdoutLine = (line: string) => {
 			if (!line.trim()) return;
-			let event: ChildEvent & { assistantMessageEvent?: { type?: string } };
+			let event: ChildEvent & { assistantMessageEvent?: AssistantMessageEvent };
 			try {
-				event = JSON.parse(line) as ChildEvent & { assistantMessageEvent?: { type?: string } };
+				event = JSON.parse(line) as ChildEvent & { assistantMessageEvent?: AssistantMessageEvent };
 			} catch {
 				rawStdoutLines.push(line);
 				writeOutputLine(line);
@@ -345,7 +366,7 @@ function runPiStreaming(
 
 			if (isAssistantLifecycleEvent(event.type) && event.message) {
 				if (event.message.role === "assistant") {
-					recordAssistantMessage(event.message, event.type, event.assistantMessageEvent?.type);
+					recordAssistantMessage(event.message, event.type, event.assistantMessageEvent);
 					return;
 				}
 				if (event.type === "message_end") messages.push(event.message);

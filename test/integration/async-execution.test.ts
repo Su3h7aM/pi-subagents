@@ -750,7 +750,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		mockPi.onCall({ jsonl: events.streamedAssistantMessage("Done from streamed async mock") });
 
 		const id = `async-streamed-${Date.now().toString(36)}`;
-		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
 
 		executeAsyncSingle(id, {
 			agent: "echo",
@@ -773,6 +772,60 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
 		assert.equal(payload.success, true);
 		assert.equal(payload.results[0].output, "Done from streamed async mock");
+	});
+
+	it("background runs capture text_delta assistant output without duplicating the final text", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ jsonl: events.streamedAssistantMessage("Delta async text") });
+
+		const id = `async-streamed-delta-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "echo",
+			task: "Say hello",
+			agentConfig: makeAgent("echo"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.output, "Delta async text");
+	});
+
+	it("background runs capture multiple text_delta chunks without duplicating the final text", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ jsonl: events.streamedAssistantMessageDeltas(["Hello ", "async ", "chunks"], "Hello async chunks") });
+
+		const id = `async-streamed-multi-delta-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "echo",
+			task: "Say hello",
+			agentConfig: makeAgent("echo"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.output, "Hello async chunks");
 	});
 
 	it("background runs do not force-drain after a non-terminal assistant message_start before later updates arrive", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
