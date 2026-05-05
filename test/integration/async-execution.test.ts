@@ -746,6 +746,107 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(payload.results[0].attemptedModels, ["github-copilot/gpt-5-mini"]);
 	});
 
+	it("background runs capture streamed assistant output from message_start/message_update events", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ jsonl: events.streamedAssistantMessage("Done from streamed async mock") });
+
+		const id = `async-streamed-${Date.now().toString(36)}`;
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+
+		executeAsyncSingle(id, {
+			agent: "echo",
+			task: "Say hello",
+			agentConfig: makeAgent("echo"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0].output, "Done from streamed async mock");
+	});
+
+	it("background runs do not force-drain after a non-terminal assistant message_start before later updates arrive", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ type: "message_start", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, responseId: "resp-late-async" } }] },
+				{ delay: 1500, jsonl: [{ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "late async final text" }, message: { role: "assistant", content: [{ type: "text", text: "late async final text" }], model: "mock/test-model", stopReason: "stop", usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } }, responseId: "resp-late-async" } }] },
+			],
+		});
+
+		const id = `async-late-update-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "echo",
+			task: "Say hello",
+			agentConfig: makeAgent("echo"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.output, "late async final text");
+	});
+
+	it("background runs do not force-drain before delayed tool-use turns that mutate files", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ type: "message_start", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, responseId: "resp-tool-async" } }] },
+				{ delay: 1500, jsonl: [
+					{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "src/file.ts", oldText: "a", newText: "b" } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } }, responseId: "resp-tool-async" } },
+					events.toolStart("edit", { path: "src/file.ts", oldText: "a", newText: "b" }),
+					events.toolEnd("edit"),
+					events.toolResult("edit", "Applied"),
+					events.assistantMessage("Applied edit"),
+				] },
+			],
+		});
+
+		const id = `async-delayed-tool-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement the approved file changes",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.output, "Applied edit");
+	});
+
 	it("background runs resolve skills from the effective task cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Done asynchronously" });
 		const taskCwd = createTempDir("pi-subagent-async-task-cwd-");

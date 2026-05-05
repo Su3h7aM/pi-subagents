@@ -401,12 +401,73 @@ async function runSingleAttempt(
 			emitUpdateSnapshot(getFinalOutput(result.messages) || "(running...)");
 		};
 
+		let activeAssistantIndex: number | undefined;
+		let activeAssistantResponseId: string | undefined;
+		let activeAssistantUsage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } | undefined;
+		const getAssistantResponseId = (message: Message): string | undefined => {
+			const responseId = (message as { responseId?: unknown }).responseId;
+			return typeof responseId === "string" && responseId.trim() ? responseId : undefined;
+		};
+		const toUsageSnapshot = (usage: { input?: number; inputTokens?: number; output?: number; outputTokens?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } | undefined) => ({
+			input: usage?.input ?? usage?.inputTokens ?? 0,
+			output: usage?.output ?? usage?.outputTokens ?? 0,
+			cacheRead: usage?.cacheRead ?? 0,
+			cacheWrite: usage?.cacheWrite ?? 0,
+			cost: usage?.cost?.total ?? 0,
+		});
+		const isAssistantLifecycleEvent = (type: string): boolean => type === "message_start" || type === "message_update" || type === "message_end";
+		const isTerminalAssistantEvent = (rawType: string, assistantEventType?: string): boolean => rawType === "message_end"
+			|| (rawType === "message_update" && assistantEventType === "text_end");
+		const applyAssistantUsage = (usage: { input?: number; inputTokens?: number; output?: number; outputTokens?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } | undefined) => {
+			const next = toUsageSnapshot(usage);
+			const prev = activeAssistantUsage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+			result.usage.input += next.input - prev.input;
+			result.usage.output += next.output - prev.output;
+			result.usage.cacheRead += next.cacheRead - prev.cacheRead;
+			result.usage.cacheWrite += next.cacheWrite - prev.cacheWrite;
+			result.usage.cost += next.cost - prev.cost;
+			progress.tokens = result.usage.input + result.usage.output;
+			activeAssistantUsage = next;
+		};
+		const recordAssistantMessage = (message: Message, rawType: string, assistantEventType?: string) => {
+			const responseId = getAssistantResponseId(message);
+			const isSameActiveStream = activeAssistantIndex !== undefined
+				&& (!responseId || !activeAssistantResponseId || responseId === activeAssistantResponseId);
+			const shouldReplaceMessage = isSameActiveStream && rawType !== "message_end";
+			if (shouldReplaceMessage) {
+				result.messages[activeAssistantIndex] = message;
+			} else {
+				result.messages.push(message);
+				activeAssistantIndex = result.messages.length - 1;
+				activeAssistantResponseId = responseId;
+				activeAssistantUsage = undefined;
+				result.usage.turns++;
+				progress.turnCount = result.usage.turns;
+			}
+			const usage = (message as Message & { usage?: { input?: number; inputTokens?: number; output?: number; outputTokens?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } }).usage;
+			applyAssistantUsage(usage);
+			if (!result.model && (message as Message & { model?: string }).model) result.model = (message as Message & { model?: string }).model;
+			if ((message as Message & { errorMessage?: string }).errorMessage) result.error = (message as Message & { errorMessage?: string }).errorMessage;
+			appendRecentOutput(progress, extractTextFromContent(message.content).split("\n").slice(-10));
+			const stopReason = (message as { stopReason?: string }).stopReason;
+			const hasToolCall = Array.isArray(message.content)
+				&& message.content.some((part) => (part as { type?: string }).type === "toolCall");
+			if (isTerminalAssistantEvent(rawType, assistantEventType) && stopReason === "stop" && !hasToolCall) {
+				cleanTerminalAssistantStopReceived ||= !(message as Message & { errorMessage?: string }).errorMessage;
+				startFinalDrain();
+			}
+			if (rawType === "message_end") {
+				activeAssistantIndex = undefined;
+				activeAssistantResponseId = undefined;
+				activeAssistantUsage = undefined;
+			}
+		};
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
 			jsonlWriter.writeLine(line);
-			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown };
+			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown; assistantMessageEvent?: { type?: string } };
 			try {
-				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown };
+				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown; assistantMessageEvent?: { type?: string } };
 			} catch {
 				// Non-JSON stdout lines are expected; only structured events are parsed.
 				return;
@@ -450,31 +511,11 @@ async function runSingleAttempt(
 				fireUpdate();
 			}
 
-			if (evt.type === "message_end" && evt.message) {
-				result.messages.push(evt.message);
+			if (isAssistantLifecycleEvent(evt.type) && evt.message) {
 				if (evt.message.role === "assistant") {
-					result.usage.turns++;
-					progress.turnCount = result.usage.turns;
-					const u = evt.message.usage;
-					if (u) {
-						result.usage.input += u.input || 0;
-						result.usage.output += u.output || 0;
-						result.usage.cacheRead += u.cacheRead || 0;
-						result.usage.cacheWrite += u.cacheWrite || 0;
-						result.usage.cost += u.cost?.total || 0;
-						progress.tokens = result.usage.input + result.usage.output;
-					}
-					if (!result.model && evt.message.model) result.model = evt.message.model;
-					if (evt.message.errorMessage) result.error = evt.message.errorMessage;
-					appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
-					// Final assistant message: start the exit drain window.
-					const stopReason = (evt.message as { stopReason?: string }).stopReason;
-					const hasToolCall = Array.isArray(evt.message.content)
-						&& evt.message.content.some((part) => (part as { type?: string }).type === "toolCall");
-					if (stopReason === "stop" && !hasToolCall) {
-						cleanTerminalAssistantStopReceived ||= !evt.message.errorMessage;
-						startFinalDrain();
-					}
+					recordAssistantMessage(evt.message, evt.type, evt.assistantMessageEvent?.type);
+				} else if (evt.type === "message_end") {
+					result.messages.push(evt.message);
 				}
 				updateActivityState(now);
 				fireUpdate();

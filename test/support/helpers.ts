@@ -165,6 +165,35 @@ export const events = {
 		};
 	},
 
+	streamedAssistantMessage(text: string, model = "mock/test-model", responseId = "resp-mock"): object[] {
+		const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } };
+		return [
+			{
+				type: "message_start",
+				message: {
+					role: "assistant",
+					content: [],
+					model,
+					responseId,
+					stopReason: "stop",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+				},
+			},
+			{
+				type: "message_update",
+				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: text },
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text }],
+					model,
+					responseId,
+					stopReason: "stop",
+					usage,
+				},
+			},
+		];
+	},
+
 	toolStart(toolName: string, args: Record<string, unknown> = {}): object {
 		return { type: "tool_execution_start", toolName, args };
 	},

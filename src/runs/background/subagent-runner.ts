@@ -262,11 +262,70 @@ function runPiStreaming(
 			appendChildEvent({ type, line });
 		};
 
+		let activeAssistantIndex: number | undefined;
+		let activeAssistantResponseId: string | undefined;
+		let activeAssistantUsage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } | undefined;
+		const getAssistantResponseId = (message: ChildMessage): string | undefined => {
+			const responseId = (message as ChildMessage & { responseId?: unknown }).responseId;
+			return typeof responseId === "string" && responseId.trim() ? responseId : undefined;
+		};
+		const toUsageSnapshot = (messageUsage: ChildUsage | undefined) => ({
+			input: messageUsage?.input ?? messageUsage?.inputTokens ?? 0,
+			output: messageUsage?.output ?? messageUsage?.outputTokens ?? 0,
+			cacheRead: messageUsage?.cacheRead ?? 0,
+			cacheWrite: messageUsage?.cacheWrite ?? 0,
+			cost: messageUsage?.cost?.total ?? 0,
+		});
+		const isAssistantLifecycleEvent = (type: string): boolean => type === "message_start" || type === "message_update" || type === "message_end";
+		const isTerminalAssistantEvent = (rawType: string, assistantEventType?: string): boolean => rawType === "message_end"
+			|| (rawType === "message_update" && assistantEventType === "text_end");
+		const applyAssistantUsage = (messageUsage: ChildUsage | undefined) => {
+			const next = toUsageSnapshot(messageUsage);
+			const prev = activeAssistantUsage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+			if (!activeAssistantUsage) usage.turns++;
+			usage.input += next.input - prev.input;
+			usage.output += next.output - prev.output;
+			usage.cacheRead += next.cacheRead - prev.cacheRead;
+			usage.cacheWrite += next.cacheWrite - prev.cacheWrite;
+			usage.cost += next.cost - prev.cost;
+			activeAssistantUsage = next;
+		};
+		const recordAssistantMessage = (message: ChildMessage, rawType: string, assistantEventType?: string) => {
+			const responseId = getAssistantResponseId(message);
+			const isSameActiveStream = activeAssistantIndex !== undefined
+				&& (!responseId || !activeAssistantResponseId || responseId === activeAssistantResponseId);
+			const shouldReplaceMessage = isSameActiveStream && rawType !== "message_end";
+			if (shouldReplaceMessage) {
+				messages[activeAssistantIndex] = message;
+			} else {
+				messages.push(message);
+				activeAssistantIndex = messages.length - 1;
+				activeAssistantResponseId = responseId;
+				activeAssistantUsage = undefined;
+			}
+			const text = extractTextFromContent(message.content);
+			if (text) writeOutputText(text);
+			if (message.model) model = message.model;
+			if (message.errorMessage) error = message.errorMessage;
+			applyAssistantUsage(message.usage);
+			const stopReason = (message as { stopReason?: string }).stopReason;
+			const hasToolCall = Array.isArray(message.content)
+				&& message.content.some((part) => (part as { type?: string }).type === "toolCall");
+			if (isTerminalAssistantEvent(rawType, assistantEventType) && stopReason === "stop" && !hasToolCall) {
+				cleanTerminalAssistantStopReceived ||= !message.errorMessage;
+				startFinalDrain();
+			}
+			if (rawType === "message_end") {
+				activeAssistantIndex = undefined;
+				activeAssistantResponseId = undefined;
+				activeAssistantUsage = undefined;
+			}
+		};
 		const processStdoutLine = (line: string) => {
 			if (!line.trim()) return;
-			let event: ChildEvent;
+			let event: ChildEvent & { assistantMessageEvent?: { type?: string } };
 			try {
-				event = JSON.parse(line) as ChildEvent;
+				event = JSON.parse(line) as ChildEvent & { assistantMessageEvent?: { type?: string } };
 			} catch {
 				rawStdoutLines.push(line);
 				writeOutputLine(line);
@@ -284,30 +343,18 @@ function runPiStreaming(
 				return;
 			}
 
-			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+			if (isAssistantLifecycleEvent(event.type) && event.message) {
+				if (event.message.role === "assistant") {
+					recordAssistantMessage(event.message, event.type, event.assistantMessageEvent?.type);
+					return;
+				}
+				if (event.type === "message_end") messages.push(event.message);
+			}
+
+			if (event.type === "tool_result_end" && event.message) {
 				messages.push(event.message);
 				const text = extractTextFromContent(event.message.content);
 				if (text) writeOutputText(text);
-
-				if (event.type !== "message_end" || event.message.role !== "assistant") return;
-				if (event.message.model) model = event.message.model;
-				if (event.message.errorMessage) error = event.message.errorMessage;
-				const eventUsage = event.message.usage;
-				if (eventUsage) {
-					usage.turns++;
-					usage.input += eventUsage.input ?? eventUsage.inputTokens ?? 0;
-					usage.output += eventUsage.output ?? eventUsage.outputTokens ?? 0;
-					usage.cacheRead += eventUsage.cacheRead ?? 0;
-					usage.cacheWrite += eventUsage.cacheWrite ?? 0;
-					usage.cost += eventUsage.cost?.total ?? 0;
-				}
-				const stopReason = (event.message as { stopReason?: string }).stopReason;
-				const hasToolCall = Array.isArray(event.message.content)
-					&& event.message.content.some((part) => (part as { type?: string }).type === "toolCall");
-				if (stopReason === "stop" && !hasToolCall) {
-					cleanTerminalAssistantStopReceived ||= !event.message.errorMessage;
-					startFinalDrain();
-				}
 			}
 		};
 

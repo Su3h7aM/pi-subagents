@@ -162,6 +162,54 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(output, "Hello from mock agent");
 	});
 
+	it("captures streamed assistant output from message_start/message_update events", async () => {
+		mockPi.onCall({ jsonl: events.streamedAssistantMessage("Hello from streamed mock agent") });
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Say hello", {});
+
+		assert.equal(result.exitCode, 0);
+		assert.ok(result.messages.length > 0, "should have messages");
+		assert.equal(getFinalOutput(result.messages), "Hello from streamed mock agent");
+		assert.equal(result.usage.turns, 1);
+		assert.equal(result.usage.input, 100);
+		assert.equal(result.usage.output, 50);
+	});
+
+	it("does not force-drain after a non-terminal assistant message_start before later updates arrive", async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ type: "message_start", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, responseId: "resp-late" } }] },
+				{ delay: 1500, jsonl: [{ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "late final text" }, message: { role: "assistant", content: [{ type: "text", text: "late final text" }], model: "mock/test-model", stopReason: "stop", usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } }, responseId: "resp-late" } }] },
+			],
+		});
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Say hello", {});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(getFinalOutput(result.messages), "late final text");
+	});
+
+	it("does not force-drain before delayed tool-use turns that mutate files", async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ type: "message_start", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, responseId: "resp-tool" } }] },
+				{ delay: 1500, jsonl: [
+					{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "src/file.ts", oldText: "a", newText: "b" } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } }, responseId: "resp-tool" } },
+					events.toolStart("edit", { path: "src/file.ts", oldText: "a", newText: "b" }),
+					events.toolEnd("edit"),
+					events.toolResult("edit", "Applied"),
+					events.assistantMessage("Applied edit"),
+				] },
+			],
+		});
+		const agents = [makeAgent("worker")];
+
+		const result = await runSync(tempDir, agents, "worker", "Implement the approved file changes", {});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.finalOutput, "Applied edit");
+	});
+
 	it("fails implementation runs that complete without mutation attempts", async () => {
 		mockPi.onCall({ output: "Validation:\nlet rawFilename = params.filename.trim();" });
 		const agents = [makeAgent("worker")];
